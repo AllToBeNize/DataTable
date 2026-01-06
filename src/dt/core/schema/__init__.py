@@ -1,0 +1,1 @@
+from dt.core.schema.registry import SchemaRegistry
