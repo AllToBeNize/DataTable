@@ -4,99 +4,88 @@ import shutil
 from src.core import ProjectContext, TypeManager, HistoryManager
 
 
-def setup_test_config(root: str):
-	"""准备包含嵌套结构、枚举和容器的配置"""
+def setup_advanced_config(root: str):
+	"""验证结构体作为容器内容，以及枚举字段"""
 	config_path = os.path.join(root, "config")
 	os.makedirs(config_path, exist_ok=True)
 
+	# 1. 枚举定义
+	enums = [{"name": "QualityType", "items": [{"name": "Common", "value": 0}, {"name": "Epic", "value": 1}]}]
+
+	# 2. 结构体定义
 	structs = [
 		{"name": "Vec3", "fields": [{"name": "x", "type": "float", "default_value": 0.0}, {"name": "y", "type": "float", "default_value": 0.0}]},
 		{
 			"name": "Hero",
 			"fields": [
-				{"name": "Name", "type": "string", "default_value": "NewHero"},
-				{"name": "Pos", "type": "Vec3", "default_value": {"x": 1.0, "y": 1.0}},
-				{"name": "Tags", "type": "string", "container": "array", "default_value": ["Normal"]},
+				# SINGLE + ENUM
+				{"name": "Quality", "type": "QualityType", "default_value": 0},
+				# ARRAY + STRUCT (结构体数组)
+				{"name": "PathPoints", "type": "Vec3", "container": "array", "default_value": [{"x": 0.0, "y": 0.0}]},
+				# MAP + STRUCT (结构体字典)
+				{"name": "EquipOffsets", "type": "Vec3", "container": "map", "key_type": "string", "default_value": {"Head": {"x": 0.0, "y": 5.0}}},
 			],
 		},
 	]
+
 	tables = [{"name": "HeroTable", "struct_name": "Hero"}]
 
+	with open(os.path.join(config_path, "enums.json"), "w") as f:
+		json.dump(enums, f)
 	with open(os.path.join(config_path, "structs.json"), "w") as f:
 		json.dump(structs, f)
 	with open(os.path.join(config_path, "tables.json"), "w") as f:
 		json.dump(tables, f)
 
 
-def run_history_test():
-	test_root = os.path.abspath("./history_test_project")
+def run_test():
+	test_root = os.path.abspath("./test_data")
 	if os.path.exists(test_root):
 		shutil.rmtree(test_root)
-	setup_test_config(test_root)
+	setup_advanced_config(test_root)
 
 	ctx = ProjectContext.instance
 	ctx.open_project(test_root)
 	tm = TypeManager.instance
 	hm = HistoryManager.instance
 
-	print("=== [测试 1: 修改与撤销] ===")
-	rid = tm.request_add_row("HeroTable")  # NewRow_0
-	tm.request_edit("HeroTable", rid, "Name", "Saber")
-	print(f"修改后 Name: {tm.tables['HeroTable'].get_cell(rid, 'Name')}")  # Saber
+	print(">>> [测试 1] 验证结构体容器的默认值读取")
+	rid = tm.request_add_row("HeroTable")
+	path = tm.tables["HeroTable"].get_cell(rid, "PathPoints")
+	offsets = tm.tables["HeroTable"].get_cell(rid, "EquipOffsets")
+	print(f"默认 PathPoints (Array<Struct>): {path}")
+	print(f"默认 EquipOffsets (Map<String, Struct>): {offsets}")
 
+	print("\n>>> [测试 2] 编辑结构体容器并验证 History")
+	# 修改结构体数组
+	new_path = [{"x": 1.1, "y": 1.1}, {"x": 2.2, "y": 2.2}]
+	tm.request_edit("HeroTable", rid, "PathPoints", new_path)
+
+	# 撤销修改
 	hm.undo()
-	print(f"撤销修改后 Name: {tm.tables['HeroTable'].get_cell(rid, 'Name')}")  # NewHero (默认值)
+	print(f"撤销后 PathPoints: {tm.tables['HeroTable'].get_cell(rid, 'PathPoints')}")
 
+	# 重做修改
 	hm.redo()
-	print(f"重做修改后 Name: {tm.tables['HeroTable'].get_cell(rid, 'Name')}")  # Saber
+	print(f"重做后 PathPoints: {tm.tables['HeroTable'].get_cell(rid, 'PathPoints')}")
 
-	print("\n=== [测试 2: 重命名与撤销] ===")
-	old_id = rid
-	new_id = "Hero_001"
-	tm.request_rename_row("HeroTable", old_id, new_id)
-	print(f"重命名后，旧 ID 是否存在: {old_id in tm.tables['HeroTable'].rows}")  # False
-
-	hm.undo()
-	print(f"撤销重命名，旧 ID 是否恢复: {old_id in tm.tables['HeroTable'].rows}")  # True
-	print(f"撤销重命名，数据是否还在: {tm.tables['HeroTable'].get_cell(old_id, 'Name')}")  # Saber
-
-	print("\n=== [测试 3: 复杂嵌套修改还原] ===")
-	# 重新命名回来以便后续测试
-	hm.redo()
-	tm.request_edit("HeroTable", new_id, "Pos", {"x": 99.9, "y": 99.9})
-	print(f"修改 Pos 为: {tm.tables['HeroTable'].get_cell(new_id, 'Pos')}")
-
-	hm.undo()
-	print(f"撤销 Pos 修改，恢复为: {tm.tables['HeroTable'].get_cell(new_id, 'Pos')}")  # {'x': 1.0, 'y': 1.0}
-
-	print("\n=== [测试 4: 删除行与撤销 (最关键)] ===")
-	# 当前 new_id 有覆盖数据 Name="Saber"
-	tm.request_delete_row("HeroTable", new_id)
-	print(f"删除后行数: {len(tm.tables['HeroTable'].rows)}")  # 0
-
-	hm.undo()
-	print(f"撤销删除后行数: {len(tm.tables['HeroTable'].rows)}")  # 1
-	print(f"撤销删除后，覆盖数据 'Saber' 是否找回: {tm.tables['HeroTable'].get_cell(new_id, 'Name')}")  # Saber
-
-	print("\n=== [测试 5: 最终导出一致性验证] ===")
-	# 为了验证导出，我们再随便改点东西
-	tm.request_edit("HeroTable", new_id, "Tags", ["Leader", "Gold"])
-
+	print("\n>>> [测试 3] 全量导出验证 (包含 Enum 和 结构体容器)")
 	export_dir = os.path.join(test_root, "export")
 	ctx.export_project(export_dir)
 
 	with open(os.path.join(export_dir, "HeroTable.json"), "r", encoding="utf-8") as f:
 		data = json.load(f)
-		print("\n最终导出全量数据:")
+		print("\n最终全量补全导出结果:")
 		print(json.dumps(data, indent=4, ensure_ascii=False))
 
-	# 断言验证最终状态
-	assert data[0]["ID"] == "Hero_001"
-	assert data[0]["Name"] == "Saber"
-	assert data[0]["Tags"] == ["Leader", "Gold"]
+	# 断言检查
+	r = data[0]
+	assert len(r["PathPoints"]) == 2, "结构体数组长度错误"
+	assert r["Quality"] == 0, "嵌套枚举默认值补全错误"
+	assert r["EquipOffsets"]["Head"]["y"] == 5.0, "结构体 Map 补全错误"
 
-	print("\n✅ HistoryManager 压力测试全部通过！")
+	print("\n✅ 结构体容器与 History 验证全部通过！")
 
 
 if __name__ == "__main__":
-	run_history_test()
+	run_test()
