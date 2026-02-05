@@ -1,91 +1,93 @@
 import os
 import json
-from typing import Optional
+from typing import Optional, List, Type, Any
 from src.core.singleton import Singleton
 from src.core.type_manager import TypeManager
-from src.schema import StructDefinition, EnumDefinition, TableDefinition
+
+# 导入你提供的 Pydantic 模型
+from src.schema.enum import EnumDefinition
+from src.schema.struct import StructDefinition
+from src.schema.table import TableDefinition
 
 
 class ProjectContext(metaclass=Singleton):
-	def __init__(self):
+	def __init__(self) -> None:
 		self.project_root: Optional[str] = None
-		self.config_path: str = ""
-		self.workspace_path: str = ""
-		self.is_dirty: bool = False  # 标记是否有未保存的修改
+		self.is_dirty: bool = False
 
-	def __enter__(self):
-		return self
+	def open_project(self, root_path: str) -> None:
+		self.project_root = os.path.abspath(root_path)
 
-	def __exit__(self, exc_type, exc_val, exc_tb):
-		if exc_type is None and self.is_dirty:
-			self.save_project()
+		# 1. 按照依赖顺序加载：Enum -> Struct -> Table
+		# 使用 Pydantic 的 model_validate (Pydantic V2)
+		self._load_config("enums.json", EnumDefinition)
+		self._load_config("structs.json", StructDefinition)
+		self._load_config("tables.json", TableDefinition)
 
-	def open_project(self, root_path: str):
-		"""初始化项目路径并加载所有数据"""
-		self.project_root = root_path
-		self.config_path = os.path.join(root_path, "config")
-		self.workspace_path = os.path.join(root_path, "workspace")
+		# 2. 加载增量数据
+		self._load_workspace_data()
 
-		for p in [self.config_path, self.workspace_path]:
-			if not os.path.exists(p):
-				os.makedirs(p, exist_ok=True)
-
-		self._reload_all_metadata()
-		self._reload_all_data()
 		self.is_dirty = False
-		print(f"Project context initialized at: {root_path}")
+		print(f"🚀 项目加载成功: {self.project_root}")
 
-	def _reload_all_metadata(self):
-		"""从 config 目录加载所有的定义"""
-		# 加载枚举
-		self._load_json_to_manager(os.path.join(self.config_path, "enums.json"), EnumDefinition)
-		# 加载结构体
-		self._load_json_to_manager(os.path.join(self.config_path, "structs.json"), StructDefinition)
-		# 加载表定义
-		self._load_json_to_manager(os.path.join(self.config_path, "tables.json"), TableDefinition, is_table=True)
+	def _load_config(self, filename: str, model_class: Type[Any]) -> None:
+		"""利用 Pydantic 自动递归解析 JSON 列表"""
+		tm = TypeManager.instance
+		path = os.path.join(self.project_root, "config", filename)
 
-	def _load_json_to_manager(self, path, schema_cls, is_table=False):
 		if not os.path.exists(path):
 			return
+
 		with open(path, "r", encoding="utf-8") as f:
-			items = json.load(f)
-			for item in items:
-				obj = schema_cls(**item)
-				if is_table:
-					# 创建内存 Table 实例
-					TypeManager.instance.create_table_instance(obj)
-				else:
-					# 注册元数据
-					TypeManager.instance.register_schema(obj)
+			raw_data = json.load(f)
 
-	def _reload_all_data(self):
-		"""从 workspace 加载行数据"""
-		for table_name, table in TypeManager.instance.tables.items():
-			data_file = os.path.join(self.workspace_path, f"{table_name}.json")
-			if os.path.exists(data_file):
-				with open(data_file, "r", encoding="utf-8") as f:
-					rows_dict = json.load(f)
-					for rid_str, content in rows_dict.items():
-						rid = int(rid_str)
-						for f_name, val in content.get("values", {}).items():
-							is_ov = content.get("overridden", {}).get(f_name, False)
-							table._set_internal(rid, f_name, val, is_ov)
+		for item in raw_data:
+			# Pydantic 核心魔法：自动将 dict 转换为强类型对象，处理所有嵌套 FieldDefinition
+			obj = model_class.model_validate(item)
 
-	def save_project(self):
-		"""持久化到硬盘"""
-		if not self.workspace_path:
+			if isinstance(obj, TableDefinition):
+				tm.create_table_instance(obj)
+			else:
+				tm.register_schema(obj)
+
+	def _load_workspace_data(self) -> None:
+		workspace_dir = os.path.join(self.project_root, "workspace")
+		if not os.path.exists(workspace_dir):
 			return
 
-		for name, table in TypeManager.instance.tables.items():
-			save_path = os.path.join(self.workspace_path, f"{name}.json")
-			data_to_save = {}
-			for rid, rdata in table.rows.items():
-				data_to_save[rid] = {"values": rdata.values, "overridden": rdata.overridden}
-			with open(save_path, "w", encoding="utf-8") as f:
-				json.dump(data_to_save, f, indent=4, ensure_ascii=False)
+		tm = TypeManager.instance
+		for table_name, table in tm.tables.items():
+			path = os.path.join(workspace_dir, f"{table_name}.json")
+			if not os.path.exists(path):
+				continue
 
+			with open(path, "r", encoding="utf-8") as f:
+				content = json.load(f)
+				for rid, row_dict in content.items():
+					table._add_row_internal(rid)
+					table.rows[rid].values = row_dict.get("values", {})
+					table.rows[rid].overridden = row_dict.get("overridden", {})
+
+	def save_project(self) -> None:
+		if not self.project_root:
+			return
+		workspace_dir = os.path.join(self.project_root, "workspace")
+		os.makedirs(workspace_dir, exist_ok=True)
+
+		tm = TypeManager.instance
+		for table_name, table in tm.tables.items():
+			file_path = os.path.join(workspace_dir, f"{table_name}.json")
+			# 序列化为增量字典
+			save_bundle = {rid: {"values": r.values, "overridden": r.overridden} for rid, r in table.rows.items()}
+			with open(file_path, "w", encoding="utf-8") as f:
+				json.dump(save_bundle, f, indent=4, ensure_ascii=False)
 		self.is_dirty = False
-		print("Project saved to disk.")
 
-	def mark_dirty(self):
+	def export_project(self, target_dir: Optional[str] = None) -> List[str]:
+		from src.generators.json_exporter import JsonExporter
+
+		export_path = target_dir or os.path.join(self.project_root, "export")
+		return JsonExporter.export_all(export_path)
+
+	def mark_dirty(self) -> None:
 		self.is_dirty = True
